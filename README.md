@@ -26,6 +26,8 @@ required by the host. Transport is off by default and listens on IPv4 loopback o
 | `fusionmcp.ui.menus`, `fusionmcp.ui.messagebox.answer` | Open menus and the visible message box; answer it by button index or label. |
 | `fusionmcp.camera.state` / `mode` / `look` | Camera mode, player yaw/pitch, look-at-reference. |
 | `fusionmcp.input.hold` | Mutating, async. Synthetic button events prepended to the engine's own per-frame `PlayerControls` input pass. |
+| `fusionmcp.input.click` | Mutating. Real OS mouse click (left/right/middle) at `{x, y}` client-area pixels of the Fallout 4 window via `SendInput`, for clicking Prisma UI overlays. Refused unless `Fallout4.exe` is the foreground process. |
+| `fusionmcp.input.key` | Mutating, async. Real OS key press for `{key, durationMs?}` (letter, digit, F1..F24, Enter, Escape, Space, Tab, arrows, Shift, Ctrl, Alt; default 100 ms, max 2000), read by the game through `GetAsyncKeyState`. Refused unless `Fallout4.exe` is the foreground process; the key is released on cancel. |
 | `fusionmcp.wait.until` | Async condition barrier (world ready, menus, message box, 3D, combat, death, distance). |
 | `fusionmcp.anim.variables`, `fusionmcp.anim.watch` | Animation graph variables and recorded graph events of a reference. |
 | `fusionmcp.anim.active_clips` | Read-only. Clip generators on the active branch of each behaviour graph of a reference, plus the equipped weapon's 1P/3P graphs: animation file, behaviour file, playback speed, local time. |

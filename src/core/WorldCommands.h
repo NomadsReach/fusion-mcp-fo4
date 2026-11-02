@@ -34,11 +34,12 @@ public:
     std::optional<FUSIONMCP_Status> Poll(const std::string& operation,FUSIONMCP_WriteFn writer,void* sink);
     bool Cancel(const std::string& operation);
 private:
-    enum class Kind {Hold,Wait,Watch,Spawn};
+    enum class Kind {Hold,Wait,Watch,Spawn,Key};
     struct Operation {
         Kind kind=Kind::Hold;
         RequestTime started,deadline;
         std::vector<Control> controls;
+        std::uint16_t virtualKey=0;
         std::string condition,menu;
         std::uint32_t target=0;
         float radius=0;

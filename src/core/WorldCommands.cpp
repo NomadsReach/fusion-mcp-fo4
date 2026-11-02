@@ -1,4 +1,5 @@
 #include "WorldCommands.h"
+#include "runtime/OsInput.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -32,6 +33,13 @@ constexpr const char* kLookSchema=R"({"type":"object","properties":{"yaw":{"type
 constexpr const char* kHoldSchema=R"({"type":"object","properties":{"controls":{"type":"array","minItems":1,"maxItems":6,"items":{"enum":
 ["forward","back","strafe_left","strafe_right","jump","sprint","sneak","activate","reload","fire","aim","ready_weapon"]}},
 "durationMs":{"type":"integer","minimum":1,"maximum":10000}},"required":["controls","durationMs"],"additionalProperties":false})";
+constexpr const char* kClickSchema=R"({"type":"object","properties":{"x":{"type":"integer","minimum":0,"maximum":65535,
+"description":"Client-area pixels of the game window"},"y":{"type":"integer","minimum":0,"maximum":65535,
+"description":"Client-area pixels of the game window"},"button":{"enum":["left","right","middle"],"description":"Default left"}},
+"required":["x","y"],"additionalProperties":false})";
+constexpr const char* kKeySchema=R"({"type":"object","properties":{"key":{"type":"string","minLength":1,"maxLength":16,
+"description":"Letter, digit, F1..F24, Enter, Escape, Space, Tab, Up, Down, Left, Right, Shift, Ctrl or Alt"},
+"durationMs":{"type":"integer","minimum":0,"maximum":2000,"description":"Default 100"}},"required":["key"],"additionalProperties":false})";
 constexpr const char* kWaitSchema=R"({"type":"object","properties":{"condition":{"enum":["world_ready","menu_open","menu_closed",
 "messagebox_open","messagebox_closed","ref_3d","in_combat","not_in_combat","dead","near_player"]},
 "target":{"type":"string","minLength":1,"maxLength":128},"menu":{"type":"string","minLength":1,"maxLength":64},
@@ -55,6 +63,7 @@ constexpr const char* kActiveClipsSchema=R"({"type":"object","properties":{"targ
 "limit":{"type":"integer","minimum":1,"maximum":128,"description":"Max clips, default 48"}},"additionalProperties":false})";
 constexpr const char* kWeapon3DSchema=R"({"type":"object","properties":{"target":{"type":"string","minLength":1,"maxLength":128,"description":"Default player"}},
 "additionalProperties":false})";
+constexpr std::int64_t kMaxKeyDurationMs=2000;
 constexpr const char* kMatrixConvention="rotate[row][col] is NiMatrix3::entry as stored. FO4 renders child = transpose(rotate) * point "
     "(the transpose of CommonLib's NiMatrix3 operator*): row r of rotate is the parent-space image of local axis r.";
 
@@ -142,6 +151,10 @@ std::vector<WorldCommands::Spec> WorldCommands::Specs() {
         {"camera.mode","Switch the camera to first person, third person, or free camera (simulation keeps running).",kModeSchema,mutating},
         {"camera.look","Set player yaw/pitch in degrees (absolute, or relative=true), or turn to face target.",kLookSchema,mutating},
         {"input.hold","Hold player controls for durationMs (max 10 s) through the engine input path, then release. Async; cancel releases.",kHoldSchema,mutating|async},
+        {"input.click","Real OS mouse click (left, right or middle) at x,y in client-area pixels of the Fallout 4 window, sent by SendInput. "
+            "Refused unless Fallout4.exe is the foreground process; nothing is sent then.",kClickSchema,mutating},
+        {"input.key","Real OS key press held durationMs (max 2 s, default 100) then released, read by the game through GetAsyncKeyState. "
+            "Async. Refused unless Fallout4.exe is the foreground process; cancel releases.",kKeySchema,mutating|async},
         {"wait.until","Async barrier: completes when the condition holds on two consecutive Game owner samples, or fails at timeoutMs "
             "(default 30 s). Conditions: world_ready, menu_open/menu_closed (menu), messagebox_open/closed, ref_3d, in_combat, "
             "not_in_combat, dead (target), near_player (target, radius).",kWaitSchema,async},
@@ -314,6 +327,23 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
             }
         }
         const auto id="world-hold-"+std::to_string(i.request_id);
+        operations_[id]=std::move(o);
+        return Pending(writer,sink,id);
+    }
+    if (command=="input.click") {
+        std::string reason;
+        const auto button=args.value("button",std::string("left"));
+        if (!os_input::Click(args["x"].get<std::int32_t>(),args["y"].get<std::int32_t>(),button,reason)) return Write(writer,sink,Error("input_failed",reason));
+        return Write(writer,sink,Success({{"x",args["x"]},{"y",args["y"]},{"button",button},
+            {"note","Sent as OS input to the foreground game window; whether the game acted on it is not verified."}}));
+    }
+    if (command=="input.key") {
+        const auto durationMs=args.value("durationMs",std::int64_t{100});
+        if (durationMs<0||durationMs>kMaxKeyDurationMs) return Write(writer,sink,Error("invalid_arguments","durationMs must be 0 to 2000"));
+        Operation o;o.kind=Kind::Key;o.started=now_();o.deadline=o.started+std::chrono::milliseconds(durationMs);
+        std::string reason;
+        if (!os_input::PressKey(args["key"].get<std::string>(),o.virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
+        const auto id="world-key-"+std::to_string(i.request_id);
         operations_[id]=std::move(o);
         return Pending(writer,sink,id);
     }
@@ -495,6 +525,7 @@ bool WorldCommands::ConditionMet(Operation& o,std::string& observed) {
 void WorldCommands::Finish(Operation& o) {
     std::string ignored;
     if (o.kind==Kind::Hold) for (const auto c:o.controls) world_.SetControl(c,false,ignored);
+    if (o.kind==Kind::Key) os_input::ReleaseKey(o.virtualKey);
     if (o.kind==Kind::Watch&&o.watchId) {world_.StopAnimWatch(o.watchId);o.watchId=0;}
 }
 
@@ -517,6 +548,11 @@ std::optional<FUSIONMCP_Status> WorldCommands::Poll(const std::string& operation
         for (const auto c:o.controls) controls.push_back(ControlName(c));
         return done(Success({{"controls",std::move(controls)},{"heldMs",Ms(o.started,now)},{"released",true},
             {"note","Input was delivered to the engine; whether the player moved or acted is not verified."}}));
+    }
+    case Kind::Key: {
+        if (now<o.deadline) return FUSIONMCP_PENDING;
+        return done(Success({{"released",true},{"heldMs",Ms(o.started,now)},
+            {"note","Sent as OS input to the foreground game window; whether the game acted on it is not verified."}}));
     }
     case Kind::Wait: {
         std::string observed;
