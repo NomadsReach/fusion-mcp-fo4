@@ -25,3 +25,23 @@
 - `src/core/RequestBroker.cpp:Expire`: only Queued records expire, so a running input.type is not cut by the 30 s request deadline in `src/core/ProviderRegistry.cpp:RequestDeadline`. Checked by reading only.
 - Not verified by reading: whether the Prisma chat box accepts KEYEVENTF_UNICODE events from SendInput, and whether the game's own input filter drops them.
 - Not verified by reading: a surrogate pair whose two units are sent in one batch can be partly accepted if SendInput returns fewer events. The error then reports only the characters completed before it, and the half character is not counted.
+
+## chat.send
+
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the text goes through SplitText (1 to 256 code points, control characters refused) before anything is sent, so a refused text sends nothing. The first Enter goes through `os_input::PressKey`, which runs GameWindow itself, so the foreground check happens before the first step. CheckGameWindow is not called separately because PressKey already does that check.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the Enter key comes from `os_input::ResolveKey("enter")`, so no Windows virtual-key constant is needed in core. The key is stored in `Operation::virtualKey` for the later Enter presses and the release.
+- `src/runtime/OsInput.cpp:PressKey`: this sends a key-down only. The Enter press is therefore held with `Operation::held` until `WorldCommands::Poll` releases it, the same way input.key holds its key for GetAsyncKeyState. A tap with no hold could be missed by the game's per-frame key poll.
+- `src/core/WorldCommands.cpp:WorldCommands::Poll`: the `Kind::Chat` case releases the first Enter once kChatPauseMs (300 ms) has passed, types each character kChatCharacterDelayMs (20 ms, the input.type default) apart with TypeCharacter, then presses Enter again and holds it for kChatPauseMs before completing. The 300 ms hold on the closing Enter is the same constant as the pause, not a separate tuning value.
+- `src/core/WorldCommands.cpp:WorldCommands::Finish`: a cancelled or torn-down chat.send releases Enter when it is still held, the same as a cancelled input.key.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: a pending chat.send and a pending input.type refuse each other with kTextPending, so two text operations cannot interleave. The input.type message changed to the shared text, since it now also covers a pending chat.send.
+- Not verified by reading: whether the chat box is open when chat.send runs. If it is already open, the first Enter submits it instead of focusing it, so the caller must make sure the box is closed before it calls chat.send.
+- Not verified by reading: whether the Prisma chat box accepts the Enter hold and the KEYEVENTF_UNICODE text from SendInput.
+
+## wait.log
+
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the log is the newest listed log, found with `ResolveLog(game_.ListLogs(),"*")` as logs.read resolves a '*' name. It is resolved once when the request is accepted, so a log that becomes newer later is not followed. The log is not chosen by name because the command takes only contains and timeoutMs.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the start offset is the file size at that moment (`LogSize`), so only text appended after the request can complete it. An existing line in the log does not count, matching the default start point of logs.wait.
+- `src/core/WorldCommands.cpp:ReadLogWindow`: reads at most kMaxLogChunkBytes (64 KiB) per Poll and moves the offset forward, keeping the last contains-1 bytes for the next read, so a match split across two reads is still found. The file is read with the same ifstream and binary mode as logs.read's ReadLog in `src/core/BuiltinCommands.cpp`; ReadLog lives in an anonymous namespace, so it is not shared. Moving it into LogTools would remove the duplicate.
+- `src/core/WorldCommands.cpp:WorldCommands::Poll`: the `Kind::Log` case checks the window at each Poll. It completes on the first match and does not wait for two stable samples as wait.until does, because appended text does not disappear. A missing or unreadable log keeps the wait going, and the timeout error reports "log cannot be opened" as the last observed state.
+- `src/core/WorldCommands.cpp:kWaitLogSchema`: maxLength counts bytes, as in kTypeSchema, so the 256 limit is a byte count. A 256-character CJK string is refused, and a 256-character ASCII string is accepted.
+- Not verified by reading: which log is the game log for a given test. The newest listed log can be the F4SE log or a Papyrus log, depending on which one was written last, so a line written to the other log will not be seen.
