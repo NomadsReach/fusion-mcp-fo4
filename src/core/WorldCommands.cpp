@@ -40,6 +40,9 @@ constexpr const char* kClickSchema=R"({"type":"object","properties":{"x":{"type"
 constexpr const char* kKeySchema=R"({"type":"object","properties":{"key":{"type":"string","minLength":1,"maxLength":16,
 "description":"Letter, digit, F1..F24, Enter, Escape, Space, Tab, Up, Down, Left, Right, Shift, Ctrl or Alt"},
 "durationMs":{"type":"integer","minimum":0,"maximum":2000,"description":"Default 100"}},"required":["key"],"additionalProperties":false})";
+constexpr const char* kTypeSchema=R"({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":1024,
+"description":"UTF-8 text, 1 to 256 characters; control characters and newlines are refused, send Enter with input.key"},
+"delayMs":{"type":"integer","minimum":0,"maximum":200,"description":"Pause between characters, default 20"}},"required":["text"],"additionalProperties":false})";
 constexpr const char* kWaitSchema=R"({"type":"object","properties":{"condition":{"enum":["world_ready","menu_open","menu_closed",
 "messagebox_open","messagebox_closed","ref_3d","in_combat","not_in_combat","dead","near_player"]},
 "target":{"type":"string","minLength":1,"maxLength":128},"menu":{"type":"string","minLength":1,"maxLength":64},
@@ -64,6 +67,8 @@ constexpr const char* kActiveClipsSchema=R"({"type":"object","properties":{"targ
 constexpr const char* kWeapon3DSchema=R"({"type":"object","properties":{"target":{"type":"string","minLength":1,"maxLength":128,"description":"Default player"}},
 "additionalProperties":false})";
 constexpr std::int64_t kMaxKeyDurationMs=2000;
+constexpr std::int64_t kMaxTypeDelayMs=200;
+constexpr std::size_t kMaxTypeCharacters=256;
 constexpr const char* kMatrixConvention="rotate[row][col] is NiMatrix3::entry as stored. FO4 renders child = transpose(rotate) * point "
     "(the transpose of CommonLib's NiMatrix3 operator*): row r of rotate is the parent-space image of local axis r.";
 
@@ -155,6 +160,9 @@ std::vector<WorldCommands::Spec> WorldCommands::Specs() {
             "Refused unless Fallout4.exe is the foreground process; nothing is sent then.",kClickSchema,mutating},
         {"input.key","Real OS key press held durationMs (max 2 s, default 100) then released, read by the game through GetAsyncKeyState. "
             "Async. Refused unless Fallout4.exe is the foreground process; cancel releases.",kKeySchema,mutating|async},
+        {"input.type","Real OS text typing: each character of text (1 to 256, UTF-8) is sent to the focused Fallout 4 window as Unicode key events, "
+            "delayMs apart (default 20, max 200). Async. Refused unless Fallout4.exe is the foreground process, checked before each character; "
+            "control characters are refused, so send Enter with input.key.",kTypeSchema,mutating|async},
         {"wait.until","Async barrier: completes when the condition holds on two consecutive Game owner samples, or fails at timeoutMs "
             "(default 30 s). Conditions: world_ready, menu_open/menu_closed (menu), messagebox_open/closed, ref_3d, in_combat, "
             "not_in_combat, dead (target), near_player (target, radius).",kWaitSchema,async},
@@ -349,6 +357,19 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
         std::string reason;
         if (!os_input::PressKey(virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
         const auto id="world-key-"+std::to_string(i.request_id);
+        operations_[id]=std::move(o);
+        return Pending(writer,sink,id);
+    }
+    if (command=="input.type") {
+        const auto delayMs=args.value("delayMs",std::int64_t{20});
+        if (delayMs<0||delayMs>kMaxTypeDelayMs) return Write(writer,sink,Error("invalid_arguments","delayMs must be 0 to 200"));
+        std::vector<std::wstring> characters;
+        std::string reason;
+        if (!os_input::SplitText(args["text"].get<std::string>(),kMaxTypeCharacters,characters,reason)) return Write(writer,sink,Error("invalid_arguments",reason));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Type) return Write(writer,sink,Error("input_failed","an input.type is already pending"));
+        if (!os_input::CheckGameWindow(reason)) return Write(writer,sink,Error("input_failed",reason));
+        Operation o;o.kind=Kind::Type;o.started=now_();o.next=o.started;o.delayMs=delayMs;o.characters=std::move(characters);
+        const auto id="world-type-"+std::to_string(i.request_id);
         operations_[id]=std::move(o);
         return Pending(writer,sink,id);
     }
@@ -558,6 +579,16 @@ std::optional<FUSIONMCP_Status> WorldCommands::Poll(const std::string& operation
         if (now<o.deadline) return FUSIONMCP_PENDING;
         return done(Success({{"released",true},{"heldMs",Ms(o.started,now)},
             {"note","Sent as OS input to the foreground game window; whether the game acted on it is not verified."}}));
+    }
+    case Kind::Type: {
+        if (now<o.next) return FUSIONMCP_PENDING;
+        if (o.sent==o.characters.size()) return done(Success({{"sent",o.sent},{"delayMs",o.delayMs},
+            {"note","Sent as OS input to the foreground game window; whether the game accepted the text is not verified."}}));
+        std::string reason;
+        if (!os_input::TypeCharacter(o.characters[o.sent],reason)) return done(Error("input_failed",reason+"; characters sent before the failure: "+std::to_string(o.sent)));
+        ++o.sent;
+        o.next=now+std::chrono::milliseconds(o.delayMs);
+        return FUSIONMCP_PENDING;
     }
     case Kind::Wait: {
         std::string observed;

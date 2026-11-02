@@ -14,3 +14,14 @@
 - `src/core/WorldCommands.cpp`: this core file includes `runtime/OsInput.h`. The Win32 code stays in `src/runtime/OsInput.cpp`, which is only listed in the FusionMCP target in `xmake.lua`. The core static library has no link step of its own, so no core-only binary can reference these symbols.
 - Not verified by reading: injected events set only the virtual key (wScan is 0, arrows are not flagged extended). If Fallout 4 reads a path other than GetAsyncKeyState for some keys, injected presses may not register there.
 - Not verified by reading: the foreground check and SendInput can race if focus changes between them. UIPI or a locked desktop make SendInput return fewer events, which is reported as an error.
+
+## input.type
+
+- `src/runtime/OsInput.cpp:SplitText`: UTF-8 is decoded with MultiByteToWideChar and MB_ERR_INVALID_CHARS, so invalid UTF-8 is refused. Each code point becomes one entry, and a surrogate pair stays one entry so both units go out together. Code points below 0x20 are refused before anything is sent, and the length limit (1 to 256 code points) is applied after decoding.
+- `src/core/WorldCommands.cpp:kTypeSchema`: maxLength is 1024 bytes, not 256 characters, because `src/core/Json.cpp:MatchesSchema` compares byte sizes. A valid 256-character CJK string is longer than 256 bytes, so the character limit is enforced in SplitText instead.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: input.type is asynchronous like input.key. A synchronous loop with delayMs between up to 256 characters would hold the game owner thread for about 51 s. The foreground check (CheckGameWindow) runs here, so a refused request sends nothing and returns invalid_arguments or input_failed at once. A second pending input.type is refused, since two operations would interleave their characters.
+- `src/core/WorldCommands.cpp:WorldCommands::Poll`: the `Kind::Type` case sends one character each time delayMs has passed, and returns the count sent on success. Only completed characters are counted.
+- `src/runtime/OsInput.cpp:TypeCharacter`: each character is one SendInput batch of KEYEVENTF_UNICODE key-down and key-up events, with wScan set to the UTF-16 unit and wVk left at 0. GameWindow runs before every character, so focus moving to another window stops the typing.
+- `src/core/RequestBroker.cpp:Expire`: only Queued records expire, so a running input.type is not cut by the 30 s request deadline in `src/core/ProviderRegistry.cpp:RequestDeadline`. Checked by reading only.
+- Not verified by reading: whether the Prisma chat box accepts KEYEVENTF_UNICODE events from SendInput, and whether the game's own input filter drops them.
+- Not verified by reading: a surrogate pair whose two units are sent in one batch can be partly accepted if SendInput returns fewer events. The error then reports only the characters completed before it, and the half character is not counted.
