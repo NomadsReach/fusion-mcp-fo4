@@ -1,8 +1,11 @@
 #include "WorldCommands.h"
 #include "runtime/OsInput.h"
+#include "LogTools.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 
 namespace fusionmcp {
 namespace {
@@ -43,6 +46,12 @@ constexpr const char* kKeySchema=R"({"type":"object","properties":{"key":{"type"
 constexpr const char* kTypeSchema=R"({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":1024,
 "description":"UTF-8 text, 1 to 256 characters; control characters and newlines are refused, send Enter with input.key"},
 "delayMs":{"type":"integer","minimum":0,"maximum":200,"description":"Pause between characters, default 20"}},"required":["text"],"additionalProperties":false})";
+constexpr const char* kChatSchema=R"({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":1024,
+"description":"UTF-8 text, 1 to 256 characters, typed into the already-open chat box; control characters and newlines are refused"}},
+"required":["text"],"additionalProperties":false})";
+constexpr const char* kWaitLogSchema=R"({"type":"object","properties":{"contains":{"type":"string","minLength":1,"maxLength":256,
+"description":"Text to find in the game log, case-insensitive, in lines appended after the command starts"},
+"timeoutMs":{"type":"integer","minimum":0,"maximum":120000,"description":"Default 30000"}},"required":["contains"],"additionalProperties":false})";
 constexpr const char* kWaitSchema=R"({"type":"object","properties":{"condition":{"enum":["world_ready","menu_open","menu_closed",
 "messagebox_open","messagebox_closed","ref_3d","in_combat","not_in_combat","dead","near_player"]},
 "target":{"type":"string","minLength":1,"maxLength":128},"menu":{"type":"string","minLength":1,"maxLength":64},
@@ -69,6 +78,10 @@ constexpr const char* kWeapon3DSchema=R"({"type":"object","properties":{"target"
 constexpr std::int64_t kMaxKeyDurationMs=2000;
 constexpr std::int64_t kMaxTypeDelayMs=200;
 constexpr std::size_t kMaxTypeCharacters=256;
+constexpr std::int64_t kChatPauseMs=300;
+constexpr std::int64_t kChatCharacterDelayMs=20;
+constexpr std::uint64_t kMaxLogChunkBytes=65536;
+constexpr const char* kTextPending="a text input (input.type or chat.send) is already pending";
 constexpr const char* kMatrixConvention="rotate[row][col] is NiMatrix3::entry as stored. FO4 renders child = transpose(rotate) * point "
     "(the transpose of CommonLib's NiMatrix3 operator*): row r of rotate is the parent-space image of local axis r.";
 
@@ -135,6 +148,26 @@ FUSIONMCP_Status Pending(FUSIONMCP_WriteFn writer,void* sink,const std::string& 
 std::int64_t Ms(RequestTime from,RequestTime to) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(to-from).count();
 }
+std::optional<std::uint64_t> LogSize(const std::string& path) {
+    std::ifstream file(std::filesystem::path(path),std::ios::binary);
+    if (!file) return std::nullopt;
+    file.seekg(0,std::ios::end);
+    return static_cast<std::uint64_t>(std::max<std::streamoff>(0,file.tellg()));
+}
+std::optional<std::string> ReadLogWindow(const std::string& path,std::uint64_t& offset,std::size_t keep) {
+    std::ifstream file(std::filesystem::path(path),std::ios::binary);
+    if (!file) return std::nullopt;
+    file.seekg(0,std::ios::end);
+    const auto size=static_cast<std::uint64_t>(std::max<std::streamoff>(0,file.tellg()));
+    if (offset>size) offset=0;
+    const auto count=std::min<std::uint64_t>(kMaxLogChunkBytes,size-offset);
+    std::string text(static_cast<std::size_t>(count),'\0');
+    file.seekg(static_cast<std::streamoff>(offset));
+    file.read(text.data(),static_cast<std::streamsize>(count));
+    text.resize(static_cast<std::size_t>(file.gcount()));
+    offset+=text.size()>keep?text.size()-keep:0;
+    return text;
+}
 }
 
 std::vector<WorldCommands::Spec> WorldCommands::Specs() {
@@ -163,9 +196,14 @@ std::vector<WorldCommands::Spec> WorldCommands::Specs() {
         {"input.type","Real OS text typing: each character of text (1 to 256, UTF-8) is sent to the focused Fallout 4 window as Unicode key events, "
             "delayMs apart (default 20, max 200). Async. Refused unless Fallout4.exe is the foreground process, checked before each character; "
             "control characters are refused, so send Enter with input.key.",kTypeSchema,mutating|async},
+        {"chat.send","Real OS chat line: Enter focuses the already-open chat box, then after 300 ms the text (1 to 256 characters, as input.type) "
+            "is typed and Enter is pressed. Async. Refused unless Fallout4.exe is the foreground process, checked before each step; "
+            "control characters are refused.",kChatSchema,mutating|async},
         {"wait.until","Async barrier: completes when the condition holds on two consecutive Game owner samples, or fails at timeoutMs "
             "(default 30 s). Conditions: world_ready, menu_open/menu_closed (menu), messagebox_open/closed, ref_3d, in_combat, "
             "not_in_combat, dead (target), near_player (target, radius).",kWaitSchema,async},
+        {"wait.log","Async: completes when the newest listed game log contains text (case-insensitive) in lines appended after the "
+            "command starts, or fails at timeoutMs (default 30 s).",kWaitLogSchema,async},
         {"anim.variables","Read animation graph variables (float, int or bool) on a reference.",kVariablesSchema,0},
         {"node.transform","Read-only: one scene graph node of a reference's 1P or 3P 3D by name: local and world transform "
             "(translate, 3x3 rotate as stored, scale), parent, flags, appCulled / ancestorCulled and world bound.",kNodeTransformSchema,0},
@@ -353,6 +391,7 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
         std::uint16_t virtualKey=0;
         if (!os_input::ResolveKey(args["key"].get<std::string>(),virtualKey)) return Write(writer,sink,Error("input_failed","Unknown key name; use a letter, digit, F1..F24, Enter, Escape, Space, Tab, Up, Down, Left, Right, Shift, Ctrl or Alt"));
         for (const auto& entry:operations_) if (entry.second.kind==Kind::Key&&entry.second.virtualKey==virtualKey) return Write(writer,sink,Error("input_failed","key already held by a pending input.key"));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Chat&&entry.second.virtualKey==virtualKey) return Write(writer,sink,Error("input_failed","Enter is held by a pending chat.send"));
         Operation o;o.kind=Kind::Key;o.virtualKey=virtualKey;o.started=now_();o.deadline=o.started+std::chrono::milliseconds(durationMs);
         std::string reason;
         if (!os_input::PressKey(virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
@@ -366,10 +405,24 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
         std::vector<std::wstring> characters;
         std::string reason;
         if (!os_input::SplitText(args["text"].get<std::string>(),kMaxTypeCharacters,characters,reason)) return Write(writer,sink,Error("invalid_arguments",reason));
-        for (const auto& entry:operations_) if (entry.second.kind==Kind::Type) return Write(writer,sink,Error("input_failed","an input.type is already pending"));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Type||entry.second.kind==Kind::Chat) return Write(writer,sink,Error("input_failed",kTextPending));
         if (!os_input::CheckGameWindow(reason)) return Write(writer,sink,Error("input_failed",reason));
         Operation o;o.kind=Kind::Type;o.started=now_();o.next=o.started;o.delayMs=delayMs;o.characters=std::move(characters);
         const auto id="world-type-"+std::to_string(i.request_id);
+        operations_[id]=std::move(o);
+        return Pending(writer,sink,id);
+    }
+    if (command=="chat.send") {
+        std::vector<std::wstring> characters;
+        std::string reason;
+        if (!os_input::SplitText(args["text"].get<std::string>(),kMaxTypeCharacters,characters,reason)) return Write(writer,sink,Error("invalid_arguments",reason));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Type||entry.second.kind==Kind::Chat) return Write(writer,sink,Error("input_failed",kTextPending));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Key) return Write(writer,sink,Error("input_failed","an input.key is pending; its Enter would collide with chat.send"));
+        Operation o;o.kind=Kind::Chat;o.started=now_();o.characters=std::move(characters);
+        if (!os_input::ResolveKey("enter",o.virtualKey)) return Write(writer,sink,Error("input_failed","Enter key is unavailable"));
+        if (!os_input::PressKey(o.virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
+        o.held=true;o.next=o.started+std::chrono::milliseconds(kChatPauseMs);
+        const auto id="world-chat-"+std::to_string(i.request_id);
         operations_[id]=std::move(o);
         return Pending(writer,sink,id);
     }
@@ -390,6 +443,19 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
         }
         if (o.condition=="near_player") o.radius=args.value("radius",500.0f);
         const auto id="world-wait-"+std::to_string(i.request_id);
+        operations_[id]=std::move(o);
+        return Pending(writer,sink,id);
+    }
+    if (command=="wait.log") {
+        const auto found=ResolveLog(game_.ListLogs(),"*");
+        if (!found) return Write(writer,sink,Error("not_found","No game log is listed"));
+        const auto size=LogSize(found->path);
+        if (!size) return Write(writer,sink,Error("unavailable","Log cannot be opened"));
+        Operation o;o.kind=Kind::Log;o.started=now_();
+        o.deadline=o.started+std::chrono::milliseconds(args.value("timeoutMs",static_cast<std::int64_t>(kDefaultWait.count())));
+        o.contains=Lower(args["contains"].get<std::string>());
+        o.log=found->name;o.logPath=found->path;o.logOffset=*size;
+        const auto id="world-log-"+std::to_string(i.request_id);
         operations_[id]=std::move(o);
         return Pending(writer,sink,id);
     }
@@ -551,7 +617,7 @@ bool WorldCommands::ConditionMet(Operation& o,std::string& observed) {
 void WorldCommands::Finish(Operation& o) {
     std::string ignored;
     if (o.kind==Kind::Hold) for (const auto c:o.controls) world_.SetControl(c,false,ignored);
-    if (o.kind==Kind::Key) os_input::ReleaseKey(o.virtualKey);
+    if (o.kind==Kind::Key||(o.kind==Kind::Chat&&o.held)) os_input::ReleaseKey(o.virtualKey);
     if (o.kind==Kind::Watch&&o.watchId) {world_.StopAnimWatch(o.watchId);o.watchId=0;}
 }
 
@@ -590,6 +656,23 @@ std::optional<FUSIONMCP_Status> WorldCommands::Poll(const std::string& operation
         o.next=now+std::chrono::milliseconds(o.delayMs);
         return FUSIONMCP_PENDING;
     }
+    case Kind::Chat: {
+        if (now<o.next) return FUSIONMCP_PENDING;
+        std::string reason;
+        if (o.held) {os_input::ReleaseKey(o.virtualKey);o.held=false;}
+        if (o.sent<o.characters.size()) {
+            if (!os_input::TypeCharacter(o.characters[o.sent],reason)) return done(Error("input_failed",reason+"; characters sent before the failure: "+std::to_string(o.sent)));
+            ++o.sent;
+            o.next=now+std::chrono::milliseconds(kChatCharacterDelayMs);
+            return FUSIONMCP_PENDING;
+        }
+        if (!o.submitted) {
+            if (!os_input::PressKey(o.virtualKey,reason)) return done(Error("input_failed",reason));
+            o.submitted=true;o.held=true;o.next=now+std::chrono::milliseconds(kChatPauseMs);
+            return FUSIONMCP_PENDING;
+        }
+        return done(Success({{"sent",o.sent},{"note","Sent as OS input to the foreground game window; whether the chat accepted the line is not verified."}}));
+    }
     case Kind::Wait: {
         std::string observed;
         if (ConditionMet(o,observed)) {
@@ -598,6 +681,13 @@ std::optional<FUSIONMCP_Status> WorldCommands::Poll(const std::string& operation
         } else o.stable=0;
         if (now>=o.deadline) return done(Error("timeout","Condition "+o.condition+" not met before timeoutMs; last observed: "+observed));
         return FUSIONMCP_PENDING;
+    }
+    case Kind::Log: {
+        const auto text=ReadLogWindow(o.logPath,o.logOffset,o.contains.size()-1);
+        if (text&&Lower(*text).find(o.contains)!=std::string::npos)
+            return done(Success({{"log",Printable(o.log)},{"met",true},{"elapsedMs",Ms(o.started,now)},{"samples",o.polls}}));
+        if (now<o.deadline) return FUSIONMCP_PENDING;
+        return done(Error("timeout","Log "+Printable(o.log)+" does not contain the text before timeoutMs; last observed: "+(text?"not found":"log cannot be opened")));
     }
     case Kind::Spawn: {
         std::vector<RefInfo> placed;
