@@ -90,4 +90,45 @@ void ReleaseKey(std::uint16_t virtualKey) {
     std::string ignored;
     SendKey(virtualKey,KEYEVENTF_KEYUP,ignored);
 }
+
+bool SplitText(const std::string& utf8,std::size_t maxCharacters,std::vector<std::wstring>& characters,std::string& error) {
+    const auto limit="text must be 1 to "+std::to_string(maxCharacters)+" characters of valid UTF-8";
+    const auto length=utf8.empty()?0:MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,utf8.data(),static_cast<int>(utf8.size()),nullptr,0);
+    if (length<=0) {error=limit;return false;}
+    std::wstring wide(static_cast<std::size_t>(length),L'\0');
+    if (MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,utf8.data(),static_cast<int>(utf8.size()),wide.data(),length)!=length) {
+        error=limit;
+        return false;
+    }
+    characters.clear();
+    for (std::size_t i=0;i<wide.size();) {
+        if (wide[i]<0x20) {error="control characters and newlines are refused; send Enter with input.key";return false;}
+        const bool pair=wide[i]>=0xD800&&wide[i]<=0xDBFF&&i+1<wide.size()&&wide[i+1]>=0xDC00&&wide[i+1]<=0xDFFF;
+        const std::size_t width=pair?2:1;
+        characters.push_back(wide.substr(i,width));
+        i+=width;
+    }
+    if (characters.empty()||characters.size()>maxCharacters) {error=limit;return false;}
+    return true;
+}
+
+bool CheckGameWindow(std::string& error) {
+    return GameWindow(error)!=nullptr;
+}
+
+bool TypeCharacter(const std::wstring& character,std::string& error) {
+    if (!GameWindow(error)) return false;
+    INPUT inputs[4]{};
+    UINT count=0;
+    for (const wchar_t unit:character) {
+        inputs[count].type=INPUT_KEYBOARD;
+        inputs[count].ki.wScan=unit;
+        inputs[count].ki.dwFlags=KEYEVENTF_UNICODE;
+        inputs[count+1].type=INPUT_KEYBOARD;
+        inputs[count+1].ki.wScan=unit;
+        inputs[count+1].ki.dwFlags=KEYEVENTF_UNICODE|KEYEVENTF_KEYUP;
+        count+=2;
+    }
+    return Inject(inputs,count,error);
+}
 }

@@ -34,7 +34,7 @@ public:
     std::optional<FUSIONMCP_Status> Poll(const std::string& operation,FUSIONMCP_WriteFn writer,void* sink);
     bool Cancel(const std::string& operation);
 private:
-    enum class Kind {Hold,Wait,Watch,Spawn,Key};
+    enum class Kind {Hold,Wait,Watch,Spawn,Key,Type,Log,Chat};
     struct Operation {
         Kind kind=Kind::Hold;
         RequestTime started,deadline;
@@ -46,10 +46,17 @@ private:
         unsigned stable=0,polls=0;
         std::uint64_t watchId=0;
         std::string contains;
+        std::string log,logPath;
+        std::uint64_t logOffset=0;
         std::vector<AnimEvent> events;
         std::size_t dropped=0;
         std::uint32_t base=0,count=0;
         std::set<std::uint32_t> before;
+        std::vector<std::wstring> characters;
+        std::size_t sent=0;
+        bool held=false,submitted=false;
+        std::int64_t delayMs=0;
+        RequestTime next;
     };
     std::optional<std::uint32_t> Target(const Json& args,const char* key,const char* fallback,Json& error);
     bool ConditionMet(Operation& o,std::string& observed);
