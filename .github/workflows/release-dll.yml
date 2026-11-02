@@ -25,6 +25,7 @@ jobs:
         with:
           repository: G-A-R-D-E-N/commonlibf4-nomad
           path: lib/commonlibf4
+          submodules: recursive
 
       - name: Check out Fusion framework
         uses: actions/checkout@v4
