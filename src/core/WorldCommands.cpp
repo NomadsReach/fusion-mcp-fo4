@@ -391,6 +391,7 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
         std::uint16_t virtualKey=0;
         if (!os_input::ResolveKey(args["key"].get<std::string>(),virtualKey)) return Write(writer,sink,Error("input_failed","Unknown key name; use a letter, digit, F1..F24, Enter, Escape, Space, Tab, Up, Down, Left, Right, Shift, Ctrl or Alt"));
         for (const auto& entry:operations_) if (entry.second.kind==Kind::Key&&entry.second.virtualKey==virtualKey) return Write(writer,sink,Error("input_failed","key already held by a pending input.key"));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Chat&&entry.second.virtualKey==virtualKey) return Write(writer,sink,Error("input_failed","Enter is held by a pending chat.send"));
         Operation o;o.kind=Kind::Key;o.virtualKey=virtualKey;o.started=now_();o.deadline=o.started+std::chrono::milliseconds(durationMs);
         std::string reason;
         if (!os_input::PressKey(virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
@@ -416,6 +417,7 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
         std::string reason;
         if (!os_input::SplitText(args["text"].get<std::string>(),kMaxTypeCharacters,characters,reason)) return Write(writer,sink,Error("invalid_arguments",reason));
         for (const auto& entry:operations_) if (entry.second.kind==Kind::Type||entry.second.kind==Kind::Chat) return Write(writer,sink,Error("input_failed",kTextPending));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Key) return Write(writer,sink,Error("input_failed","an input.key is pending; its Enter would collide with chat.send"));
         Operation o;o.kind=Kind::Chat;o.started=now_();o.characters=std::move(characters);
         if (!os_input::ResolveKey("enter",o.virtualKey)) return Write(writer,sink,Error("input_failed","Enter key is unavailable"));
         if (!os_input::PressKey(o.virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
