@@ -175,7 +175,9 @@ std::vector<WorldCommands::Spec> WorldCommands::Specs() {
 }
 
 WorldCommands::WorldCommands(WorldServices& world,GameServices& game,RequestBroker::NowFn now):world_(world),game_(game),now_(std::move(now)) {}
-WorldCommands::~WorldCommands()=default;
+WorldCommands::~WorldCommands() {
+    for (auto& entry:operations_) Finish(entry.second);
+}
 
 std::optional<std::uint32_t> WorldCommands::Target(const Json& args,const char* key,const char* fallback,Json& error) {
     const auto spec=args.contains(key)?args[key].get<std::string>():std::string(fallback?fallback:"");
@@ -340,9 +342,12 @@ std::optional<FUSIONMCP_Status> WorldCommands::Invoke(const std::string& command
     if (command=="input.key") {
         const auto durationMs=args.value("durationMs",std::int64_t{100});
         if (durationMs<0||durationMs>kMaxKeyDurationMs) return Write(writer,sink,Error("invalid_arguments","durationMs must be 0 to 2000"));
-        Operation o;o.kind=Kind::Key;o.started=now_();o.deadline=o.started+std::chrono::milliseconds(durationMs);
+        std::uint16_t virtualKey=0;
+        if (!os_input::ResolveKey(args["key"].get<std::string>(),virtualKey)) return Write(writer,sink,Error("input_failed","Unknown key name; use a letter, digit, F1..F24, Enter, Escape, Space, Tab, Up, Down, Left, Right, Shift, Ctrl or Alt"));
+        for (const auto& entry:operations_) if (entry.second.kind==Kind::Key&&entry.second.virtualKey==virtualKey) return Write(writer,sink,Error("input_failed","key already held by a pending input.key"));
+        Operation o;o.kind=Kind::Key;o.virtualKey=virtualKey;o.started=now_();o.deadline=o.started+std::chrono::milliseconds(durationMs);
         std::string reason;
-        if (!os_input::PressKey(args["key"].get<std::string>(),o.virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
+        if (!os_input::PressKey(virtualKey,reason)) return Write(writer,sink,Error("input_failed",reason));
         const auto id="world-key-"+std::to_string(i.request_id);
         operations_[id]=std::move(o);
         return Pending(writer,sink,id);
