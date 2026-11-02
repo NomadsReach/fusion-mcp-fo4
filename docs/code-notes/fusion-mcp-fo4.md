@@ -1,0 +1,47 @@
+# fusion-mcp-fo4 code notes
+
+## OS input commands (input.click, input.key)
+
+- `src/runtime/OsInput.cpp:GameWindow`: the foreground window is the only target. It is taken from GetForegroundWindow, and its owning process id from GetWindowThreadProcessId must equal GetCurrentProcessId(), so only a window owned by this game process is accepted. The process image name is not checked, because any other process can share the `Fallout4.exe` name. No process handle is opened. Nothing is foregrounded.
+- `src/runtime/OsInput.cpp:Click`: the client rect is checked before ClientToScreen, so out-of-range coordinates send nothing. The absolute position is normalized over the virtual desktop (MOUSEEVENTF_VIRTUALDESK), and move, button down and button up go in one SendInput batch.
+- `src/runtime/OsInput.cpp:ResolveKey`: key names are matched case-insensitively. Unknown names are refused in `src/core/WorldCommands.cpp:WorldCommands::Invoke` before PressKey, so nothing is sent for them.
+- `src/runtime/OsInput.cpp:ReleaseKey`: the key-up is sent even if the foreground changed after the key-down. A key left down in the async key state would stay pressed in the game, so the release is not gated on the foreground check. This departs from the brief's "send nothing when not foreground" for the release half only.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: input.key is asynchronous, so the game owner thread never sleeps for up to 2 s. The key goes down in Invoke and is released from Poll at the deadline.
+- `src/core/WorldCommands.cpp:WorldCommands::Poll`: the `Kind::Key` case only waits for the deadline and reports `heldMs`.
+- `src/core/WorldCommands.cpp:WorldCommands::Finish`: a cancelled key operation releases the key, as input.hold releases its controls.
+- `src/core/WorldCommands.cpp:WorldCommands::~WorldCommands`: at teardown every pending operation in operations_ goes through Finish, the same path as cancel. A key still held when the plugin unloads is released, and input.hold controls are cleared and anim watches stopped. The owner outlives WorldCommands, so the world reference is valid here.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: a new input.key is refused with "key already held by a pending input.key" when a pending Kind::Key operation already has the same virtual key. Without this, the first deadline would release a key the second request still wants. The check runs before PressKey, so the refused request sends nothing.
+- `src/core/WorldCommands.cpp`: this core file includes `runtime/OsInput.h`. The Win32 code stays in `src/runtime/OsInput.cpp`, which is only listed in the FusionMCP target in `xmake.lua`. The core static library has no link step of its own, so no core-only binary can reference these symbols.
+- Not verified by reading: injected events set only the virtual key (wScan is 0, arrows are not flagged extended). If Fallout 4 reads a path other than GetAsyncKeyState for some keys, injected presses may not register there.
+- Not verified by reading: the foreground check and SendInput can race if focus changes between them. UIPI or a locked desktop make SendInput return fewer events, which is reported as an error.
+
+## input.type
+
+- `src/runtime/OsInput.cpp:SplitText`: UTF-8 is decoded with MultiByteToWideChar and MB_ERR_INVALID_CHARS, so invalid UTF-8 is refused. Each code point becomes one entry, and a surrogate pair stays one entry so both units go out together. Code points below 0x20 are refused before anything is sent, and the length limit (1 to 256 code points) is applied after decoding.
+- `src/core/WorldCommands.cpp:kTypeSchema`: maxLength is 1024 bytes, not 256 characters, because `src/core/Json.cpp:MatchesSchema` compares byte sizes. A valid 256-character CJK string is longer than 256 bytes, so the character limit is enforced in SplitText instead.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: input.type is asynchronous like input.key. A synchronous loop with delayMs between up to 256 characters would hold the game owner thread for about 51 s. The foreground check (CheckGameWindow) runs here, so a refused request sends nothing and returns invalid_arguments or input_failed at once. A second pending input.type is refused, since two operations would interleave their characters.
+- `src/core/WorldCommands.cpp:WorldCommands::Poll`: the `Kind::Type` case sends one character each time delayMs has passed, and returns the count sent on success. Only completed characters are counted.
+- `src/runtime/OsInput.cpp:TypeCharacter`: each character is one SendInput batch of KEYEVENTF_UNICODE key-down and key-up events, with wScan set to the UTF-16 unit and wVk left at 0. GameWindow runs before every character, so focus moving to another window stops the typing.
+- `src/core/RequestBroker.cpp:Expire`: only Queued records expire, so a running input.type is not cut by the 30 s request deadline in `src/core/ProviderRegistry.cpp:RequestDeadline`. Checked by reading only.
+- Not verified by reading: whether the Prisma chat box accepts KEYEVENTF_UNICODE events from SendInput, and whether the game's own input filter drops them.
+- Not verified by reading: a surrogate pair whose two units are sent in one batch can be partly accepted if SendInput returns fewer events. The error then reports only the characters completed before it, and the half character is not counted.
+
+## chat.send
+
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the text goes through SplitText (1 to 256 code points, control characters refused) before anything is sent, so a refused text sends nothing. The first Enter goes through `os_input::PressKey`, which runs GameWindow itself, so the foreground check happens before the first step. CheckGameWindow is not called separately because PressKey already does that check.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the Enter key comes from `os_input::ResolveKey("enter")`, so no Windows virtual-key constant is needed in core. The key is stored in `Operation::virtualKey` for the later Enter presses and the release.
+- `src/runtime/OsInput.cpp:PressKey`: this sends a key-down only. The Enter press is therefore held with `Operation::held` until `WorldCommands::Poll` releases it, the same way input.key holds its key for GetAsyncKeyState. A tap with no hold could be missed by the game's per-frame key poll.
+- `src/core/WorldCommands.cpp:WorldCommands::Poll`: the `Kind::Chat` case releases the first Enter once kChatPauseMs (300 ms) has passed, types each character kChatCharacterDelayMs (20 ms, the input.type default) apart with TypeCharacter, then presses Enter again and holds it for kChatPauseMs before completing. The 300 ms hold on the closing Enter is the same constant as the pause, not a separate tuning value.
+- `src/core/WorldCommands.cpp:WorldCommands::Finish`: a cancelled or torn-down chat.send releases Enter when it is still held, the same as a cancelled input.key.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: a pending chat.send and a pending input.type refuse each other with kTextPending, so two text operations cannot interleave. The input.type message changed to the shared text, since it now also covers a pending chat.send.
+- Not verified by reading: whether the chat box is open when chat.send runs. If it is already open, the first Enter submits it instead of focusing it, so the caller must make sure the box is closed before it calls chat.send.
+- Not verified by reading: whether the Prisma chat box accepts the Enter hold and the KEYEVENTF_UNICODE text from SendInput.
+
+## wait.log
+
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the log is the newest listed log, found with `ResolveLog(game_.ListLogs(),"*")` as logs.read resolves a '*' name. It is resolved once when the request is accepted, so a log that becomes newer later is not followed. The log is not chosen by name because the command takes only contains and timeoutMs.
+- `src/core/WorldCommands.cpp:WorldCommands::Invoke`: the start offset is the file size at that moment (`LogSize`), so only text appended after the request can complete it. An existing line in the log does not count, matching the default start point of logs.wait.
+- `src/core/WorldCommands.cpp:ReadLogWindow`: reads at most kMaxLogChunkBytes (64 KiB) per Poll and moves the offset forward, keeping the last contains-1 bytes for the next read, so a match split across two reads is still found. The file is read with the same ifstream and binary mode as logs.read's ReadLog in `src/core/BuiltinCommands.cpp`; ReadLog lives in an anonymous namespace, so it is not shared. Moving it into LogTools would remove the duplicate.
+- `src/core/WorldCommands.cpp:WorldCommands::Poll`: the `Kind::Log` case checks the window at each Poll. It completes on the first match and does not wait for two stable samples as wait.until does, because appended text does not disappear. A missing or unreadable log keeps the wait going, and the timeout error reports "log cannot be opened" as the last observed state.
+- `src/core/WorldCommands.cpp:kWaitLogSchema`: maxLength counts bytes, as in kTypeSchema, so the 256 limit is a byte count. A 256-character CJK string is refused, and a 256-character ASCII string is accepted.
+- Not verified by reading: which log is the game log for a given test. The newest listed log can be the F4SE log or a Papyrus log, depending on which one was written last, so a line written to the other log will not be seen.
