@@ -1,0 +1,59 @@
+name: Release DLL
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the DLL to (leave empty to only upload an artifact)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out FusionMCP
+        uses: actions/checkout@v4
+
+      - name: Check out CommonLibF4 (Garden)
+        uses: actions/checkout@v4
+        with:
+          repository: G-A-R-D-E-N/commonlibf4-nomad
+          path: lib/commonlibf4
+
+      - name: Check out Fusion framework
+        uses: actions/checkout@v4
+        with:
+          repository: Bryant-21/fusion-framework-fo4
+          path: extern/fusion-framework-fo4
+
+      - name: Set up xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Configure
+        run: xmake f -p windows -a x64 -m releasedbg --vs=2022 --runtime=y --commonlib_root=lib/commonlibf4 -y
+
+      - name: Build FusionMCP
+        run: xmake build -y FusionMCP
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FusionMCP-dll
+          path: build/windows/x64/releasedbg/FusionMCP.dll
+          if-no-files-found: error
+
+      - name: Attach DLL to release
+        if: github.event_name == 'release' || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: gh release upload "$TAG" build/windows/x64/releasedbg/FusionMCP.dll --clobber
